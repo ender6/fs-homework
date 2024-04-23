@@ -1,0 +1,236 @@
+apiVersion: tekton.dev/v1beta1
+kind: Pipeline
+metadata:
+  name: ci-cd
+spec:
+  description: |
+      This repository showcases a sample Tekton Pipeline designed to perform the following actions:
+
+      - Fetch the repository.
+      - Compile the Go application.
+      - Run a basic unit test.
+      - Prepare an image tag.
+      - Build and push the image to the registry via Kaniko.
+      - Scan files and images with Trivy.
+      - Deploy Kubernetes manifests via Helm.
+  params:
+  - name: repoUrl
+    type: string
+    description: The git repository URL to clone from.
+  - name: revision
+    type: string
+    description: The git branch,tag,sha etc. to fetch
+  - name: sparseCheckoutDirectories
+    type: string
+    description: directory patterns to clone
+  - name: imageUrl
+    type: string
+    description: URL of image repository in user/repo format. Do not provide the tag. e.g. dopsdemo/vote
+    default: user/repo
+  - name: imageTag
+    type: string
+    description: Tag to apply to the built image.
+    default: latest
+  - name: pathToContext
+    type: string
+    description: The path to the build context relative to your source repo's root. This is used by Kaniko.
+    default: .
+  - name: pathToDockerFile
+    type: string
+    description: The path to the dockerfile to build, relative to the context.
+    default: Dockerfile
+  - name: ARGS
+    type: array
+    description: The Arguments to be passed to Trivy command for file system scan
+  - name: IMAGEARGS
+    description: Image or Path to be scanned by trivy.
+    type: array   
+  - name: NAMESPACE
+    type: string
+    description: The namespace where the Helm release should be installed/upgraded.
+  - name: RELEASE_NAME
+    description: The name of the Helm release.
+  - name: CHART_PATH
+    description: The path to the Helm chart.
+  - name: IMAGE
+    description: The new image to use in the deployment.
+         
+  workspaces:
+  - name: shared-data
+    description: |
+      This workspace will receive the cloned git repo and be passed
+      to the next Task to list all cloned files and directories.
+  - name: dockerconfig
+    description: |
+      Add docker's config.json file as a secret and provide it as a reference. 
+  tasks:
+  - name: fetch-repo
+    taskRef:
+      name: git-clone
+    workspaces:
+    - name: output
+      workspace: shared-data
+    params:
+    - name: url
+      value: $(params.repoUrl)
+    - name: revision
+      value: $(params.revision)
+
+  - name: run-test
+    taskRef:
+      name: golang-test
+    runAfter:
+      - run-build
+    workspaces:
+      - name: source
+        workspace: shared-data
+    params:
+      - name: package
+        value: $(params.pathToContext)
+      - name: packages
+        value: $(params.pathToContext)
+      - name: GOARCH
+        value: ""
+
+  - name: run-build
+    taskRef:
+      name: golang-build
+    runAfter:
+      - fetch-repo
+    workspaces:
+      - name: source
+        workspace: shared-data
+    params:
+      - name: package
+        value: $(params.pathToContext)
+      - name: packages
+        value: $(params.pathToContext)
+
+  - name: trivy-scan-local-fs
+    taskRef:
+      name: trivy-scanner
+      kind: Task
+    runAfter:
+      - fetch-repo
+    params:
+      - name: ARGS
+        value:
+          - --severity HIGH,CRITICAL
+          - $(params.ARGS[*])
+          - --format
+          - json         
+      - name: IMAGE_PATH
+        value: .
+    workspaces:
+      - name: manifest-dir
+        workspace: shared-data      
+           
+  - name: misc
+    runAfter: ["fetch-repo"]  # Wait until the clone is done before listing all files and directories cloned
+    workspaces:
+    - name: source
+      workspace: shared-data
+    params: 
+    - name: commit-hash
+      value: $(tasks.fetch-repo.results.commit)
+    taskSpec:
+      workspaces:
+      - name: source
+      params: 
+      - name: commit-hash
+      results: 
+      - name: current-ts
+      - name: short-sha
+      steps:
+      - image: zshusers/zsh:4.3.15
+        script: |
+          #!/usr/bin/env zsh
+          ls -R $(workspaces.source.path)/
+        resources: 
+          requests: 
+            memory: 64Mi 
+            cpu: 100m 
+          limits: 
+            memory: 128Mi 
+            cpu: 200m
+      - name: print-date-unix-timestamp
+        image: bash:latest
+        script: |
+          #!/usr/bin/env bash
+          date +%s | tr -d '\n' |  tee $(results.current-ts.path)
+        resources:
+          requests:
+            memory: 64Mi
+            cpu: 100m
+          limits:
+            memory: 128Mi
+            cpu: 200m
+      - name: shorten-commit-hash
+        image: bash:latest
+        script: |
+          #!/usr/bin/env bash
+          echo $(params.commit-hash) | cut -c -8 | tr -d '\n'|  tee $(results.short-sha.path)
+        resources:
+          requests:
+            memory: 64Mi
+            cpu: 100m
+          limits:
+            memory: 128Mi
+            cpu: 200m
+
+  - name: img-build-publish
+    taskRef:
+      name: kaniko
+    runAfter:
+    - misc
+    - run-build
+    - run-test
+    workspaces:
+    - name: source
+      workspace: shared-data
+    - name: dockerconfig
+      workspace: dockerconfig
+    params:
+    - name: CONTEXT
+      value: '$(params.pathToContext)'
+    - name: IMAGE
+      value: '$(params.imageUrl):$(params.revision)-$(tasks.misc.results.short-sha)-$(tasks.misc.results.current-ts)'
+    - name: EXTRA_ARGS
+      value: [ "--skip-tls-verify" ]   
+
+  - name: trivy-scan-image
+    taskRef:
+      name: trivy-scanner
+      kind: Task
+    runAfter:
+      - img-build-publish
+    params:
+      - name: ARGS
+        value:
+          - --severity HIGH,CRITICAL
+          - $(params.IMAGEARGS[*])
+          - --format
+          - json          
+      - name: IMAGE_PATH
+        value: '$(params.imageUrl):$(params.revision)-$(tasks.misc.results.short-sha)-$(tasks.misc.results.current-ts)'
+    workspaces:
+      - name: manifest-dir
+        workspace: shared-data               
+
+  - name: deploy
+    runAfter: 
+    - trivy-scan-image
+    workspaces:
+    - name: source
+      workspace: shared-data    
+    taskRef:
+      name: helm-upgrade
+    params:
+    - name: RELEASE_NAME
+      value: go-app
+    - name: CHART_PATH
+      value: $(workspaces.source.path)/k8s
+    - name: IMAGE
+      value: "$(params.revision)-$(tasks.misc.results.short-sha)-$(tasks.misc.results.current-ts)"  
+    - name: NAMESPACE 
+      value: go-app

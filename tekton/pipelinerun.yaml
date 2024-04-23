@@ -1,0 +1,54 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: PipelineRun
+metadata:
+  generateName: ci-cd-
+spec:
+  pipelineRef:
+    name: ci-cd
+  podTemplate:
+    securityContext:
+      fsGroup: 65532
+  workspaces:
+  - name: shared-data
+    volumeClaimTemplate:
+      spec:
+        accessModes:
+        - ReadWriteOnce
+        resources:
+          requests:
+            storage: 100Mi
+  - name: dockerconfig
+    secret:
+      secretName: dockerhub-creds
+  params:
+  - name: repoUrl
+    value: https://github.com/ender6/fs-homework.git
+  - name: revision
+    value: main
+  - name: sparseCheckoutDirectories
+    value: .
+  - name: imageUrl
+    value: enderguler/tekton
+  - name: pathToContext
+    value: .
+  - name: ARGS
+    value:
+      - fs
+      - --exit-code
+      - "1"
+  - name: IMAGEARGS
+    value:
+      - image
+      - --exit-code
+      - "1"
+  - name: RELEASE_NAME
+    value: go-app
+  - name: CHART_PATH
+    value: $(workspaces.source.path)/k8s
+  - name: IMAGE
+    value: ""            
+  - name: NAMESPACE
+    value: go-app    
+    
+
